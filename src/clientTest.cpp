@@ -7,106 +7,104 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-// Bumping the limit to 32 MiB to match the server test case
-const size_t k_max_msg = 32 << 20;
-
 static void die(const char* m) {
-    fprintf(stderr, "Error [%d]: %s\n", WSAGetLastError(), m);
-    WSACleanup();
+    fprintf(stderr, "[%d] %s\n", WSAGetLastError(), m);
     exit(1);
 }
 
-// Helper: Ensure we send the entire buffer even if send() does a partial write
+// Helper to ensure all bytes are sent
 static int32_t write_all(SOCKET fd, const char* buf, size_t n) {
     while (n > 0) {
         int rv = send(fd, buf, (int)n, 0);
         if (rv <= 0) return -1;
-        n -= (size_t)rv;
+        n -= rv;
         buf += rv;
     }
     return 0;
 }
 
-// Helper: Ensure we read the exact number of bytes even if recv() does a partial read
+// Helper to ensure all bytes are read
 static int32_t read_full(SOCKET fd, char* buf, size_t n) {
     while (n > 0) {
         int rv = recv(fd, buf, (int)n, 0);
         if (rv <= 0) return -1;
-        n -= (size_t)rv;
+        n -= rv;
         buf += rv;
     }
     return 0;
 }
 
+static int32_t send_command(SOCKET fd, const std::vector<std::string>& cmd) {
+    std::vector<uint8_t> payload;
+
+    // 1. Pack the number of arguments
+    uint32_t nstr = htonl((uint32_t)cmd.size());
+    payload.insert(payload.end(), (uint8_t*)&nstr, (uint8_t*)&nstr + 4);
+
+    // 2. Pack each argument (length + data)
+    for (const std::string& s : cmd) {
+        uint32_t p_len = htonl((uint32_t)s.size());
+        payload.insert(payload.end(), (uint8_t*)&p_len, (uint8_t*)&p_len + 4);
+        payload.insert(payload.end(), s.begin(), s.end());
+    }
+
+    // 3. Prepend the total message length
+    uint32_t total_len = htonl((uint32_t)payload.size());
+    if (write_all(fd, (char*)&total_len, 4)) return -1;
+    if (write_all(fd, (char*)payload.data(), payload.size())) return -1;
+
+    return 0;
+}
+
+static int32_t read_response(SOCKET fd) {
+    // 1. Read total length
+    uint32_t net_len;
+    if (read_full(fd, (char*)&net_len, 4)) return -1;
+    uint32_t len = ntohl(net_len);
+
+    // 2. Read status (first 4 bytes of body)
+    uint32_t net_status;
+    if (read_full(fd, (char*)&net_status, 4)) return -1;
+    uint32_t status = ntohl(net_status);
+
+    // 3. Read data (remaining bytes)
+    std::vector<char> data(len - 4);
+    if (len > 4) {
+        if (read_full(fd, data.data(), len - 4)) return -1;
+    }
+
+    printf("Status: %u, Data: %.*s\n", status, (int)data.size(), data.data());
+    return 0;
+}
+
 int main() {
-    // 1. Initialize Winsock
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) die("WSAStartup");
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, 0);
 
-    SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd == INVALID_SOCKET) die("socket()");
-
-    // 2. Connect to local server
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(1234);
+    sockaddr_in addr = { AF_INET, htons(1234) };
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    connect(fd, (sockaddr*)&addr, sizeof(addr));
 
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        die("connect()");
-    }
-    printf("Connected to server.\n");
+    // TEST 1: SET
+    printf("Testing SET key=val...\n");
+    send_command(fd, { "set", "mykey", "hello world" });
+    read_response(fd);
 
-    // 3. Prepare the test data
-    std::vector<std::string> query_list = {
-        "hello1",
-        "hello2",
-        "hello3",
-        std::string(k_max_msg, 'z'), // The 32MB monster
-        "hello5"
-    };
+    // TEST 2: GET
+    printf("Testing GET key...\n");
+    send_command(fd, { "get", "mykey" });
+    read_response(fd);
 
-    // 4. PHASE 1: Pipeline all requests (Send everything first)
-    printf("Sending %zu requests in pipeline...\n", query_list.size());
-    for (const std::string& s : query_list) {
-        uint32_t len = (uint32_t)s.size();
-        uint32_t net_len = htonl(len); // Network Byte Order
+    // TEST 3: DEL
+    printf("Testing DEL key...\n");
+    send_command(fd, { "del", "mykey" });
+    read_response(fd);
 
-        // Send header
-        if (write_all(fd, (char*)&net_len, 4)) die("send header");
-        // Send body
-        if (write_all(fd, s.data(), s.size())) die("send body");
+    // TEST 4: GET (Non-existent)
+    printf("Testing GET after DEL...\n");
+    send_command(fd, { "get", "mykey" });
+    read_response(fd);
 
-        if (s.size() > 1000) {
-            printf(" -> Sent large request (%zu bytes)\n", s.size());
-        }
-        else {
-            printf(" -> Sent: %s\n", s.c_str());
-        }
-    }
-
-    // 5. PHASE 2: Collect all responses
-    printf("\nReading responses...\n");
-    for (size_t i = 0; i < query_list.size(); ++i) {
-        // Read header
-        uint32_t net_len;
-        if (read_full(fd, (char*)&net_len, 4)) die("read header");
-        uint32_t len = ntohl(net_len);
-
-        // Read body
-        std::vector<char> rbuf(len);
-        if (read_full(fd, rbuf.data(), len)) die("read body");
-
-        if (len > 1000) {
-            printf(" <- Received response %zu: %u bytes of 'z'\n", i + 1, len);
-        }
-        else {
-            printf(" <- Received response %zu: %.*s\n", i + 1, (int)len, rbuf.data());
-        }
-    }
-
-    // 6. Cleanup
-    printf("\nTest complete.\n");
     closesocket(fd);
     WSACleanup();
     return 0;
