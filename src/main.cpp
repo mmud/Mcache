@@ -10,14 +10,26 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cassert>
-
+#include "hashtable.h"
 
 #pragma comment(lib, "ws2_32.lib")
+
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 const size_t k_max_msg = 32 << 20;
 const size_t k_max_args = 200 * 1000;
 
-static std::map<std::string, std::string> g_data;
+static struct {
+    HashTable ht;              // the object
+    HashTable::HMap db;        // the map
+} g_data;
+
+struct Entry {
+    HashTable::HNode node;  // hashtable node
+    std::string key;
+    std::string val;
+};
 
 struct Conn {
     SOCKET fd = -1;
@@ -48,10 +60,10 @@ static void die(const char* msg) {
 }
 
 // append to the back
-static void
-buf_append(std::vector<uint8_t>& buf, const uint8_t* data, size_t len) {
+static void buf_append(std::vector<uint8_t>& buf, const uint8_t* data, size_t len) {
     buf.insert(buf.end(), data, data + len);
 }
+
 // remove from the front
 static void buf_consume(std::vector<uint8_t>& buf, size_t n) {
     buf.erase(buf.begin(), buf.begin() + n);
@@ -109,21 +121,82 @@ static int32_t parse_req(const uint8_t* data, size_t size, std::vector<std::stri
     return 0;
 }
 
+// equality comparison for `struct Entry`
+static bool entry_eq(HashTable::HNode* lhs, HashTable::HNode* rhs) {
+    struct Entry* le = container_of(lhs, struct Entry, node);
+    struct Entry* re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t* data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(std::vector<std::string>& cmd, Response& out) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    // hashtable lookup
+    HashTable::HNode* node = g_data.ht.hm_lookup(&g_data.db, &key.node, entry_eq);
+    if (!node) {
+        out.status = RES_NX;
+        return;
+    }
+    // copy the value
+    const std::string& val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string>& cmd, Response&) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    // hashtable lookup
+    HashTable::HNode* node = g_data.ht.hm_lookup(&g_data.db, &key.node, entry_eq);
+
+    if (node) {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    }
+    else {
+        Entry* ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+
+        g_data.ht.hm_insert(&g_data.db, &ent->node);
+    }
+}
+
+static void do_del(std::vector<std::string>& cmd, Response&) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+    // hashtable delete
+    HashTable::HNode* node = g_data.ht.hm_delete(&g_data.db, &key.node, entry_eq);
+
+    if (node) {
+        delete container_of(node, Entry, node);
+    }
+}
+
 static void do_request(std::vector<std::string>& cmd, Response& out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        auto it = g_data.find(cmd[1]);
-        if (it == g_data.end()) {
-            out.status = RES_NX;    // not found
-            return;
-        }
-        const std::string& val = it->second;
-        out.data.assign(val.begin(), val.end());
+        return do_get(cmd, out);
     }
     else if (cmd.size() == 3 && cmd[0] == "set") {
-        g_data[cmd[1]].swap(cmd[2]);
+        return do_set(cmd, out);
     }
     else if (cmd.size() == 2 && cmd[0] == "del") {
-        g_data.erase(cmd[1]);
+        return do_del(cmd, out);
     }
     else {
         out.status = RES_ERR;       // unrecognized command
@@ -198,7 +271,6 @@ static Conn* handle_accept(SOCKET fd) {
     conn->want_read = true; // read the 1st request
     return conn;
 }
-
 
 static void handle_write(Conn* conn) {
     assert(conn->outgoing.size() > 0);
@@ -298,7 +370,6 @@ int main() {
     if (listen(fd, SOMAXCONN) == SOCKET_ERROR) {
         die("listen()");
     }
-
 
     // a map of all client connections, keyed by fd
     std::unordered_map<SOCKET, Conn*> fd2conn;
