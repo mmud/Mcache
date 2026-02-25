@@ -31,6 +31,7 @@ public:
     HNode* hm_delete(HMap* hmap, HNode* key, bool (*eq)(HNode*, HNode*));
     void   hm_clear(HMap* hmap);
     size_t hm_size(HMap* hmap);
+    void hm_foreach(HMap* hmap, bool (*f)(HNode*, void*), void* arg);
 
 private:
     static void h_init(HTab* htab, size_t n);
@@ -40,4 +41,5 @@ private:
 
     static void hm_trigger_rehashing(HMap* hmap);
     static void hm_help_rehashing(HMap* hmap);
+    static bool h_foreach(HTab* htab, bool (*f)(HNode*, void*), void* arg);
 };

@@ -107,3 +107,18 @@ void HashTable::hm_clear(HashTable::HMap* hmap) {
 size_t HashTable::hm_size(HashTable::HMap* hmap) {
     return hmap->newer.size + hmap->older.size;
 }
+
+bool HashTable::h_foreach(HashTable::HTab* htab, bool (*f)(HashTable::HNode*, void*), void* arg) {
+    for (size_t i = 0; htab->mask != 0 && i <= htab->mask; i++) {
+        for (HashTable::HNode* node = htab->tab[i]; node != NULL; node = node->next) {
+            if (!f(node, arg)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void HashTable::hm_foreach(HashTable::HMap* hmap, bool (*f)(HNode*, void*), void* arg) {
+    h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
+}
