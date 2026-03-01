@@ -8,11 +8,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # First program (main)
 add_executable(MainApp
     src/main.cpp
- "src/hashtable.cpp")
+ "src/hashtable.cpp" "src/avl.cpp" "src/zset.cpp")
 
 target_include_directories(MainApp PUBLIC include)
 
 # Second program (client test)
 add_executable(ClientTest
-    src/clientTest.cpp
+    "test/clientTest.cpp"
 )
+
+# Third program (avl test)
+add_executable(AvlTest
+    "test/avlTest.cpp"
+    "src/avl.cpp"
+)
+
+target_include_directories(AvlTest PUBLIC include)
+
+# Fourth program (offest test)
+add_executable(offestTest
+    "test/test_offest.cpp"
+    "src/avl.cpp"
+)
+
+target_include_directories(offestTest PUBLIC include)
