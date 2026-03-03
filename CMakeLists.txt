@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # First program (main)
 add_executable(MainApp
     src/main.cpp
- "src/hashtable.cpp" "src/avl.cpp" "src/zset.cpp" "src/list.cpp")
+ "src/hashtable.cpp" "src/avl.cpp" "src/zset.cpp" "src/list.cpp" "src/heap.cpp")
 
 target_include_directories(MainApp PUBLIC include)
 
@@ -32,3 +32,11 @@ add_executable(offestTest
 )
 
 target_include_directories(offestTest PUBLIC include)
+
+# fifth program (heap test)
+add_executable(heapTest
+    "test/test_heap.cpp"
+    "src/heap.cpp"
+)
+
+target_include_directories(heapTest PUBLIC include)

@@ -15,6 +15,7 @@
 #include "hashtable.h"
 #include "zset.h"
 #include "list.h"
+#include "heap.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -26,7 +27,8 @@ const size_t k_max_args = 200 * 1000;
  struct {
     HashTable ht;              // the object
     HashTable::HMap db;        // the map
-    List::DList idle_list;
+	List::DList idle_list;     // idle connections
+	std::vector<Heap::HeapItem> heap;  //TTL management
 } g_data;
 
  struct Entry {
@@ -37,6 +39,8 @@ const size_t k_max_args = 200 * 1000;
 
      std::string str;
      ZSet zset;
+
+     size_t heap_idx = -1;
  };
 
 struct Conn {
@@ -81,6 +85,8 @@ enum {
     abort();
 }
 
+ static void entry_set_ttl(Entry* ent, int64_t ttl_ms);
+
  static Entry* entry_new(uint32_t type) {
      Entry* ent = new Entry();
      ent->type = type;
@@ -91,6 +97,7 @@ enum {
      if (ent->type == T_ZSET) {
          ZSet::zset_clear(&ent->zset);
      }
+     entry_set_ttl(ent, -1);
      delete ent;
  }
 
@@ -444,6 +451,96 @@ void do_del(std::vector<std::string>& cmd, Buffer& out) {
      out_end_arr(out, ctx, (uint32_t)n*2);
  }
 
+ //TTL management
+ static void heap_delete(std::vector<Heap::HeapItem>& a, size_t pos) {
+     // swap the erased item with the last item
+     a[pos] = a.back();
+     a.pop_back();
+     // update the swapped item
+     if (pos < a.size()) {
+         Heap::heap_update(a.data(), pos, a.size());
+     }
+ }
+
+ static void heap_upsert(std::vector<Heap::HeapItem>& a, size_t pos, Heap::HeapItem t) {
+     if (pos < a.size()) {
+         a[pos] = t;         // update an existing item
+     }
+     else {
+         pos = a.size();
+         a.push_back(t);     // or add a new item
+     }
+     Heap::heap_update(a.data(), pos, a.size());
+ }
+
+ static uint64_t get_monotonic_msec()
+ {
+     static LARGE_INTEGER frequency;
+     static BOOL use_qpc = QueryPerformanceFrequency(&frequency);
+
+     LARGE_INTEGER counter;
+     QueryPerformanceCounter(&counter);
+
+     return (uint64_t)(counter.QuadPart * 1000 / frequency.QuadPart);
+ }
+
+
+ // set or remove the TTL
+ static void entry_set_ttl(Entry* ent, int64_t ttl_ms) {
+     if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
+         // setting a negative TTL means removing the TTL
+         heap_delete(g_data.heap, ent->heap_idx);
+         ent->heap_idx = -1;
+     }
+     else if (ttl_ms >= 0) {
+         // add or update the heap data structure
+         uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+         Heap::HeapItem item = { expire_at, &ent->heap_idx };
+         heap_upsert(g_data.heap, ent->heap_idx, item);
+     }
+ }
+
+ // PEXPIRE key ttl_ms
+ static void do_expire(std::vector<std::string>& cmd, Buffer& out) {
+     int64_t ttl_ms = 0;
+     if (!str2int(cmd[2], ttl_ms)) {
+         return out_err(out, ERR_BAD_ARG, "expect int64");
+     }
+
+     LookupKey key;
+     key.key.swap(cmd[1]);
+     key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+
+     HashTable::HNode* node = HashTable::hm_lookup(&g_data.db, &key.node, &entry_eq);
+     if (node) {
+         Entry* ent = container_of(node, Entry, node);
+         entry_set_ttl(ent, ttl_ms);
+     }
+     return out_int(out, node ? 1 : 0);
+ }
+
+ 
+ // PTTL key
+ static void do_ttl(std::vector<std::string>& cmd, Buffer& out) {
+     LookupKey key;
+     key.key.swap(cmd[1]);
+     key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+
+     HashTable::HNode* node = HashTable::hm_lookup(&g_data.db, &key.node, &entry_eq);
+     if (!node) {
+         return out_int(out, -2);    // not found
+     }
+
+     Entry* ent = container_of(node, Entry, node);
+     if (ent->heap_idx == (size_t)-1) {
+         return out_int(out, -1);    // no TTL
+     }
+
+     uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+     uint64_t now_ms = get_monotonic_msec();
+     return out_int(out, expire_at > now_ms ? (expire_at - now_ms) : 0);
+ }
+
  static void do_request(std::vector<std::string>& cmd, Buffer& out) {
      if (cmd.size() == 2 && cmd[0] == "get") {
          return do_get(cmd, out);
@@ -455,7 +552,13 @@ void do_del(std::vector<std::string>& cmd, Buffer& out) {
          return do_del(cmd, out);
      }
      else if (cmd.size() == 1 && cmd[0] == "keys") {
-         return do_keys(cmd, out);
+        return do_keys(cmd, out);
+     }
+     else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+         return do_expire(cmd, out);
+     }
+     else if (cmd.size() == 2 && cmd[0] == "pttl") {
+         return do_ttl(cmd, out);
      }
      else if (cmd.size() == 4 && cmd[0] == "zadd") {
          return do_zadd(cmd, out);
@@ -518,17 +621,6 @@ void do_del(std::vector<std::string>& cmd, Buffer& out) {
     u_long mode = 1;      // 1 = non-blocking
     ioctlsocket(fd, FIONBIO, &mode);
 }
-
- static uint64_t get_monotonic_msec()
- {
-     static LARGE_INTEGER frequency;
-     static BOOL use_qpc = QueryPerformanceFrequency(&frequency);
-
-     LARGE_INTEGER counter;
-     QueryPerformanceCounter(&counter);
-
-     return (uint64_t)(counter.QuadPart * 1000 / frequency.QuadPart);
- }
 
  Conn* handle_accept(SOCKET fd) {
     // accept
@@ -620,17 +712,30 @@ void do_del(std::vector<std::string>& cmd, Buffer& out) {
  const uint64_t k_idle_timeout_ms = 5 * 1000;
 
  static int32_t next_timer_ms() {
+     uint64_t now_ms = get_monotonic_msec();
+     uint64_t next_ms = (uint64_t)-1;
      if (List::dlist_empty(&g_data.idle_list)) {
-         return -1;  // no timers, no timeouts
+         Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
+         next_ms = conn->last_active_ms + k_idle_timeout_ms;
      }
 
-     uint64_t now_ms = get_monotonic_msec();
-     Conn* conn = container_of(g_data.idle_list.next, Conn, idle_node);
-     uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+     // TTL timers using a heap
+     if (!g_data.heap.empty() && g_data.heap[0].val < next_ms) {
+         next_ms = g_data.heap[0].val;
+     }
+
+     if (next_ms == (uint64_t)-1) {
+         return -1;
+     }
+
      if (next_ms <= now_ms) {
-         return 0;   // missed?
+         return 0;
      }
      return (int32_t)(next_ms - now_ms);
+ }
+
+ static bool hnode_same(HashTable::HNode* node, HashTable::HNode* key) {
+     return node == key;
  }
 
  static void process_timers(std::unordered_map<SOCKET, Conn*>& fd2conn) {
@@ -647,6 +752,23 @@ void do_del(std::vector<std::string>& cmd, Buffer& out) {
          fd2conn.erase(conn->fd);
          List::dlist_detach(&conn->idle_node);
          delete conn;
+     }
+
+     // TTL timers using a heap
+     const size_t k_max_works = 2000;
+     size_t nworks = 0;
+     const std::vector<Heap::HeapItem>& heap = g_data.heap;
+     while (!heap.empty() && heap[0].val < now_ms) {
+         Entry* ent = container_of(heap[0].ref, Entry, heap_idx);
+         HashTable::HNode* node = HashTable::hm_delete(&g_data.db, &ent->node, &hnode_same);
+         assert(node == &ent->node);
+         // fprintf(stderr, "key expired: %s\n", ent->key.c_str());
+         // delete the key
+         entry_del(ent);
+         if (nworks++ >= k_max_works) {
+             // don't stall the server if too many keys are expiring at once
+             break;
+         }
      }
  }
 

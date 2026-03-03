@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include <assert.h>
 #include <cmath>
+#include <windows.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -235,6 +236,82 @@ int main() {
 
     // Error Handling
     assert(sync_command(fd, { "unknown_command" }).tag == TAG_ERR);
+
+    // ==========================================
+// PART 3: TTL TESTS (PEXPIRE, PTTL)
+// ==========================================
+    printf("[3/3] Testing TTL operations...\n");
+
+    // Set key
+    sync_command(fd, { "set", "ttl_key", "hello" });
+
+    // Set expiration 2000 ms
+    Response r_exp = sync_command(fd, { "pexpire", "ttl_key", "2000" });
+    assert(r_exp.tag == TAG_INT && r_exp.int_val == 1);
+
+    // Immediately check TTL (should be >0 and <=2000)
+    Response r_ttl = sync_command(fd, { "pttl", "ttl_key" });
+    assert(r_ttl.tag == TAG_INT);
+    assert(r_ttl.int_val > 0 && r_ttl.int_val <= 2000);
+
+    // Wait 3 seconds (3000 ms)
+    Sleep(3000);
+
+    // Now key should be expired
+    Response r_get_expired = sync_command(fd, { "get", "ttl_key" });
+    assert(r_get_expired.tag == TAG_NIL);
+
+    // PTTL should return -2 (key does not exist)
+    Response r_ttl_expired = sync_command(fd, { "pttl", "ttl_key" });
+    assert(r_ttl_expired.tag == TAG_INT && r_ttl_expired.int_val == -2);
+
+    printf("OK: Basic TTL expiration test passed.\n");
+
+    // ------------------------------------------
+    // Test updating TTL
+    // ------------------------------------------
+    sync_command(fd, { "set", "ttl_key2", "abc" });
+
+    // Set TTL 1000 ms
+    sync_command(fd, { "pexpire", "ttl_key2", "1000" });
+
+    // Update TTL to 3000 ms
+    sync_command(fd, { "pexpire", "ttl_key2", "3000" });
+
+    // Sleep 1500 ms (should NOT expire yet)
+    Sleep(1500);
+
+    // Key must still exist
+    Response r_still_exists = sync_command(fd, { "get", "ttl_key2" });
+    assert(r_still_exists.tag == TAG_STR && r_still_exists.str_val == "abc");
+
+    // Sleep additional 2000 ms (total >3000)
+    Sleep(2000);
+
+    // Now must be expired
+    assert(sync_command(fd, { "get", "ttl_key2" }).tag == TAG_NIL);
+
+    printf("OK: TTL update test passed.\n");
+
+    // ------------------------------------------
+    // Test TTL removed when key deleted
+    // ------------------------------------------
+    sync_command(fd, { "set", "ttl_key3", "xyz" });
+    sync_command(fd, { "pexpire", "ttl_key3", "5000" });
+
+    // Delete manually
+    sync_command(fd, { "del", "ttl_key3" });
+
+    // Should not exist
+    assert(sync_command(fd, { "get", "ttl_key3" }).tag == TAG_NIL);
+
+    // PTTL should return -2
+    Response r_ttl_deleted = sync_command(fd, { "pttl", "ttl_key3" });
+    assert(r_ttl_deleted.tag == TAG_INT && r_ttl_deleted.int_val == -2);
+
+    printf("OK: TTL delete interaction test passed.\n");
+
+    printf("OK: TTL tests passed.\n");
 
     closesocket(fd);
     WSACleanup();
