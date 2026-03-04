@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # First program (main)
 add_executable(MainApp
     src/main.cpp
- "src/hashtable.cpp" "src/avl.cpp" "src/zset.cpp" "src/list.cpp" "src/heap.cpp")
+ "src/hashtable.cpp" "src/avl.cpp" "src/zset.cpp" "src/list.cpp" "src/heap.cpp" "src/thread_pool.cpp")
 
 target_include_directories(MainApp PUBLIC include)
 
@@ -40,3 +40,13 @@ add_executable(heapTest
 )
 
 target_include_directories(heapTest PUBLIC include)
+
+# sixth program (Redis_Benchmark)
+add_executable(Redis_Benchmark
+    "test/MCacheVsRedis_Benchmark.cpp"
+)
+
+# seventh program (cppHashTable_Benchmark)
+add_executable(cppHashTable_Benchmark
+    "test/cppHashTable_Benchmark.cpp"
+)

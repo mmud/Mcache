@@ -313,6 +313,94 @@ int main() {
 
     printf("OK: TTL tests passed.\n");
 
+    printf("[ThreadPool] Testing async large ZSET deletion...\n");
+
+    // Create large zset
+    for (int i = 0; i < 2000; ++i) {
+        sync_command(fd, {
+            "zadd", "big_zset",
+            std::to_string(i * 1.0),
+            "member_" + std::to_string(i)
+            });
+    }
+
+    // Delete the whole key (should trigger async free)
+    sync_command(fd, { "del", "big_zset" });
+
+    // Immediately issue another command to check server responsiveness
+    Response r_ping = sync_command(fd, { "set", "after_big_delete", "ok" });
+    assert(r_ping.tag == TAG_NIL || r_ping.tag == TAG_STR);
+
+    // Ensure server didn't crash
+    assert(sync_command(fd, { "get", "after_big_delete" }).tag == TAG_STR);
+
+    printf("OK: Async large delete did not block server.\n");
+
+    printf("[ThreadPool] Testing async expiration of large ZSET...\n");
+
+    // Create large zset
+    for (int i = 0; i < 2000; ++i) {
+        sync_command(fd, {
+            "zadd", "big_ttl_zset",
+            std::to_string(i * 1.0),
+            "m_" + std::to_string(i)
+            });
+    }
+
+    // Set short TTL
+    sync_command(fd, { "pexpire", "big_ttl_zset", "1000" });
+
+    // Wait for expiration
+    Sleep(1500);
+
+    // Trigger active expiration by sending any command
+    sync_command(fd, { "set", "trigger", "x" });
+
+    // Ensure expired
+    assert(sync_command(fd, { "get", "big_ttl_zset" }).tag == TAG_NIL);
+
+    printf("OK: Async TTL expiration worked.\n");
+
+    printf("[ThreadPool] Stress expiration burst...\n");
+
+    for (int k = 0; k < 20; ++k) {
+        std::string key = "burst_" + std::to_string(k);
+        for (int i = 0; i < 1500; ++i) {
+            sync_command(fd, {
+                "zadd", key,
+                std::to_string(i),
+                "m_" + std::to_string(i)
+                });
+        }
+        sync_command(fd, { "pexpire", key, "1000" });
+    }
+
+    Sleep(1500);
+
+    // Trigger expiration
+    sync_command(fd, { "set", "trigger2", "x" });
+
+    // Ensure server still alive
+    assert(sync_command(fd, { "get", "trigger2" }).tag == TAG_STR);
+
+    printf("OK: Burst expiration did not crash.\n");
+
+    sync_command(fd, { "del", "k1" });
+    sync_command(fd, { "del", "zset" });
+    sync_command(fd, { "del", "empty_z" });
+    sync_command(fd, { "del", "ttl_key" });
+    sync_command(fd, { "del", "ttl_key2" });
+    sync_command(fd, { "del", "ttl_key3" });
+    sync_command(fd, { "del", "big_zset" });
+    sync_command(fd, { "del", "big_ttl_zset" });
+    sync_command(fd, { "del", "after_big_delete" });
+    sync_command(fd, { "del", "trigger" });
+    sync_command(fd, { "del", "trigger2" });
+    for (int k = 0; k < 20; ++k) {
+        sync_command(fd, { "del", "burst_" + std::to_string(k) });
+    }
+    printf("Cleanup done.\n");
+
     closesocket(fd);
     WSACleanup();
     printf("\n--- [SUCCESS] ALL INTEGRATION CASES PASSED ---\n");
